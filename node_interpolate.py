@@ -14,8 +14,6 @@ np.random.seed(42)
 torch.manual_seed(42)
 random.seed(42)
 
-# ======= 1. Generate Synthetic MIMIC-IV-like EHR Data =======
-
 def generate_synthetic_patient_data(num_patients=100, max_hours=120, 
                                     irregular_sampling=True, noise_level=0.05):
     """
@@ -237,8 +235,6 @@ def generate_synthetic_patient_data(num_patients=100, max_hours=120,
     
     return df, events_df
 
-# ======= 2. Neural ODE Framework =======
-
 class LatentODEFunc(nn.Module):
     """Neural ODE function defining the dynamics in latent space"""
     
@@ -331,8 +327,6 @@ class LatentODEModel(nn.Module):
         pred = pred.reshape(batch_size, num_times, -1)
         
         return pred, latent_traj
-
-# ======= 3. Dataset and Data Processing =======
 
 class PatientTrajectoryDataset(Dataset):
     """Dataset for patient trajectories"""
@@ -450,8 +444,6 @@ class PatientTrajectoryDataset(Dataset):
             'lengths': lengths,
             'mask': mask
         }
-
-# ======= 4. Training and Evaluation Functions =======
 
 def train_model(model, train_loader, epochs=10, lr=1e-3, clip_grad=10.0):
     """Train the neural ODE model"""
@@ -621,8 +613,6 @@ def visualize_patient_trajectory(time_points, true_times, true_values, pred_valu
     plt.tight_layout()
     return fig
 
-# ======= 5. Main Execution =======
-
 def main():
     # Generate synthetic EHR data
     print("Generating synthetic EHR data...")
@@ -694,6 +684,7 @@ def main():
     plt.ylabel('Loss')
     plt.title('Training Loss')
     plt.grid(True, alpha=0.3)
+    plt.savefig('training_loss.png')
     
     # Visualize example patient trajectories
     print("\nVisualizing example patient trajectories...")
@@ -726,6 +717,7 @@ def main():
         time_points, true_times, true_values, pred_values, 
         variables, variable_indices, events_df, example_id
     )
+    plt.savefig('patient_trajectory.png')
     
     # Forecasting example
     print("\nDemonstrating forecasting capability...")
@@ -748,4 +740,207 @@ def main():
         forecast_time_points, true_times, true_values, forecast_pred_values, 
         variables, variable_indices, events_df, example_id
     )
-    plt.axvline(x=true_times[half_
+    
+    # Add vertical line to show where forecasting begins
+    for i, var in enumerate(variables):
+        ax = fig_forecast.axes[i] if len(variables) > 1 else fig_forecast.axes
+        ax.axvline(x=true_times[half_length-1], color='purple', linestyle='-.',
+                  label='Forecast start')
+        if i == 0:
+            ax.legend()
+    
+    plt.savefig('patient_forecast.png')
+    
+    # Demonstrate imputation capability
+    print("\nDemonstrating imputation capability...")
+    
+    # Create data with gaps by removing some points
+    gap_indices = np.random.choice(
+        range(len(true_times)), 
+        size=len(true_times)//3, 
+        replace=False
+    )
+    
+    gap_times = np.delete(true_times, gap_indices)
+    gap_values = np.delete(true_values, gap_indices, axis=0)
+    
+    gap_data = {
+        'times': torch.FloatTensor(gap_times).unsqueeze(0),
+        'values': torch.FloatTensor(gap_values).unsqueeze(0)
+    }
+    
+    # Run imputation
+    impute_times = torch.FloatTensor(true_times).unsqueeze(0)
+    impute_time_points, impute_true_values, impute_pred_values = interpolate_trajectory(
+        model, gap_data, variables, impute_times
+    )
+    
+    # Visualize imputation
+    fig_impute = plt.figure(figsize=(12, 3*len(variables)))
+    
+    for i, var in enumerate(variables):
+        var_idx = variable_indices[i]
+        ax = plt.subplot(len(variables), 1, i+1)
+        
+        # Plot removed points differently
+        kept_mask = np.ones(len(true_times), dtype=bool)
+        kept_mask[gap_indices] = False
+        
+        # Points we kept in training data
+        ax.scatter(true_times[kept_mask], true_values[kept_mask, var_idx], 
+                   color='blue', marker='o', label='Observed', alpha=0.7)
+        
+        # Points we removed (ground truth for imputation)
+        ax.scatter(true_times[~kept_mask], true_values[~kept_mask, var_idx], 
+                   color='green', marker='x', label='Removed (ground truth)', alpha=0.7)
+        
+        # Imputed trajectory
+        ax.plot(impute_time_points, impute_pred_values[:, var_idx], 
+                color='red', label='Neural ODE imputation', alpha=0.8)
+        
+        ax.set_ylabel(var)
+        ax.grid(True, alpha=0.3)
+        
+        if i == 0:
+            ax.legend()
+    
+    plt.xlabel('Hours since admission')
+    plt.tight_layout()
+    plt.savefig('patient_imputation.png')
+    
+    # Latent space analysis
+    print("\nAnalyzing latent space trajectories...")
+    
+    # Get latent trajectories for a few patients
+    patient_samples = 3
+    latent_fig = plt.figure(figsize=(15, 10))
+    
+    # Create a 3D plot for first 3 dimensions of latent space
+    ax_3d = latent_fig.add_subplot(2, 2, 1, projection='3d')
+    
+    # 2D projections
+    ax_xy = latent_fig.add_subplot(2, 2, 2)
+    ax_xz = latent_fig.add_subplot(2, 2, 3)
+    ax_yz = latent_fig.add_subplot(2, 2, 4)
+    
+    # Get a few different patients
+    for i in range(patient_samples):
+        test_batch = next(iter(test_loader))
+        patient_id = test_batch['subject_ids'][i]
+        patient_data = {
+            'times': test_batch['times'][i:i+1],
+            'values': test_batch['values'][i:i+1]
+        }
+        
+        # Get patient vitals to know max time
+        patient_vitals = vitals_df[vitals_df['subject_id'] == patient_id]
+        max_time = patient_vitals['hours_since_admit'].max()
+        
+        # Query times for smooth trajectory
+        query_times = torch.linspace(0, max_time, 100).unsqueeze(0)
+        
+        with torch.no_grad():
+            # Get initial observation
+            first_obs = patient_data['values'][:, 0, :]
+            
+            # Get latent trajectory
+            _, latent_traj = model(first_obs, patient_data['times'][:, 0:1], query_times)
+            
+            # Extract first 3 dimensions for visualization
+            latent_traj = latent_traj.squeeze().numpy()
+            
+            if latent_traj.shape[1] >= 3:
+                x, y, z = latent_traj[:, 0], latent_traj[:, 1], latent_traj[:, 2]
+                
+                # Plot 3D trajectory
+                ax_3d.plot(x, y, z, label=f'Patient {patient_id}')
+                
+                # Plot 2D projections
+                ax_xy.plot(x, y, label=f'Patient {patient_id}')
+                ax_xz.plot(x, z)
+                ax_yz.plot(y, z)
+                
+                # Mark starting points
+                ax_3d.scatter(x[0], y[0], z[0], marker='o')
+                ax_xy.scatter(x[0], y[0], marker='o')
+                ax_xz.scatter(x[0], z[0], marker='o')
+                ax_yz.scatter(y[0], z[0], marker='o')
+    
+    ax_3d.set_title('Latent Space Trajectories (3D)')
+    ax_3d.set_xlabel('Latent Dimension 1')
+    ax_3d.set_ylabel('Latent Dimension 2') 
+    ax_3d.set_zlabel('Latent Dimension 3')
+    ax_3d.legend()
+    
+    ax_xy.set_title('Latent Dimensions 1 vs 2')
+    ax_xy.set_xlabel('Latent Dimension 1')
+    ax_xy.set_ylabel('Latent Dimension 2')
+    ax_xy.legend()
+    
+    ax_xz.set_title('Latent Dimensions 1 vs 3')
+    ax_xz.set_xlabel('Latent Dimension 1')
+    ax_xz.set_ylabel('Latent Dimension 3')
+    
+    ax_yz.set_title('Latent Dimensions 2 vs 3')
+    ax_yz.set_xlabel('Latent Dimension 2')
+    ax_yz.set_ylabel('Latent Dimension 3')
+    
+    plt.tight_layout()
+    plt.savefig('latent_space.png')
+    
+    # Create summary report
+    print("\nCreating summary statistics...")
+    
+    # For each variable, calculate MAE for interpolation, forecasting, imputation
+    summary_data = []
+    
+    for i, var in enumerate(variables):
+        var_idx = variable_indices[i]
+        
+        # Interpolation error
+        interp_mae = np.mean(np.abs(
+            true_values[:, var_idx] - 
+            np.interp(true_times, time_points, pred_values[:, var_idx])
+        ))
+        
+        # Forecasting error (only on the forecasted part)
+        forecast_indices = true_times > true_times[half_length-1]
+        if np.any(forecast_indices):
+            forecast_true = true_values[forecast_indices, var_idx]
+            forecast_pred = np.interp(
+                true_times[forecast_indices], 
+                forecast_time_points, 
+                forecast_pred_values[:, var_idx]
+            )
+            forecast_mae = np.mean(np.abs(forecast_true - forecast_pred))
+        else:
+            forecast_mae = np.nan
+        
+        # Imputation error (only on the imputed points)
+        impute_true = true_values[gap_indices, var_idx]
+        impute_pred = np.interp(
+            true_times[gap_indices], 
+            impute_time_points, 
+            impute_pred_values[:, var_idx]
+        )
+        impute_mae = np.mean(np.abs(impute_true - impute_pred))
+        
+        summary_data.append({
+            'Variable': var,
+            'Interpolation MAE': interp_mae,
+            'Forecasting MAE': forecast_mae,
+            'Imputation MAE': impute_mae
+        })
+    
+    # Create and display summary table
+    summary_df = pd.DataFrame(summary_data)
+    print("\nSummary Statistics (Mean Absolute Error):")
+    print(summary_df)
+    
+    print("\nModel successfully trained and evaluated!")
+    print("Visualizations saved as PNG files.")
+    
+    return model, vitals_df, events_df
+
+if __name__ == "__main__":
+    main()
