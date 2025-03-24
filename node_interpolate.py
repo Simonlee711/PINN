@@ -297,36 +297,40 @@ class LatentODEModel(nn.Module):
         self.decoder = Decoder(latent_dim, input_dim, hidden_dim)
         self.latent_dim = latent_dim
         
-    def forward(self, first_obs, first_time, query_times):
-        """
-        first_obs: first observation for each trajectory (batch_size, input_dim)
-        first_time: time of first observation (batch_size, 1)
-        query_times: times to query the trajectory (batch_size, num_times)
-        """
-        # Encode first observation to get initial latent state
-        first_latent = self.encoder(first_obs)
+    def forward(self, first_obs, first_time, query_times, mask=None):
+        # If no mask is provided, assume query_times is one-dimensional and common to all samples.
+        if mask is None or query_times.dim() == 1:
+            first_latent = self.encoder(first_obs)
+            latent_traj = odeint(self.dynamics, first_latent, query_times, method='dopri5')
+            # latent_traj shape: (num_times, batch_size, latent_dim)
+            latent_traj = latent_traj.permute(1, 0, 2)
+            batch_size, num_times, _ = latent_traj.shape
+            latent_traj_reshaped = latent_traj.reshape(-1, self.latent_dim)
+            pred = self.decoder(latent_traj_reshaped)
+            pred = pred.reshape(batch_size, num_times, -1)
+            return pred, latent_traj
         
-        # Make relative time differences for ODE solving
-        # Assuming first_time is 0 and query_times are relative to first_time
-        
-        # Solve ODE to get latent trajectories at all query times
-        latent_traj = odeint(self.dynamics, first_latent, query_times, method='dopri5')
-        
-        # latent_traj has shape (len(query_times), batch_size, latent_dim)
-        # Reshape to (batch_size, len(query_times), latent_dim) for easier decoding
-        latent_traj = latent_traj.permute(1, 0, 2)
-        
-        # Reshape for decoding each timepoint
-        batch_size, num_times, _ = latent_traj.shape
-        latent_traj_reshaped = latent_traj.reshape(-1, self.latent_dim)
-        
-        # Decode latent trajectories to measurements
-        pred = self.decoder(latent_traj_reshaped)
-        
-        # Reshape back to (batch_size, num_times, output_dim)
-        pred = pred.reshape(batch_size, num_times, -1)
-        
-        return pred, latent_traj
+        # Otherwise, handle each sample individually based on its valid time points.
+        batch_size, max_len = query_times.shape
+        device = query_times.device
+        # Determine output dimension from decoder's final layer.
+        out_dim = self.decoder.net[-1].out_features
+        preds = torch.zeros(batch_size, max_len, out_dim, device=device)
+        latent_trajs = []
+        for i in range(batch_size):
+            valid_len = int(mask[i].sum().item())
+            # Extract the valid (non-padded) time points (a 1D tensor).
+            t_i = query_times[i, :valid_len]
+            latent_i = self.encoder(first_obs[i].unsqueeze(0))  # shape (1, latent_dim)
+            # Solve the ODE for the i-th sample with its own time vector.
+            latent_traj_i = odeint(self.dynamics, latent_i, t_i, method='dopri5')
+            # Remove the extra batch dimension added by odeint.
+            latent_traj_i = latent_traj_i.squeeze(1)  # shape (valid_len, latent_dim)
+            pred_i = self.decoder(latent_traj_i)        # shape (valid_len, input_dim)
+            preds[i, :valid_len, :] = pred_i
+            latent_trajs.append(latent_traj_i)
+        return preds, latent_trajs
+
 
 class PatientTrajectoryDataset(Dataset):
     """Dataset for patient trajectories"""
@@ -378,7 +382,7 @@ class PatientTrajectoryDataset(Dataset):
         
         # Handle events (medications, procedures)
         # Create binary indicators for active medications/procedures at each time
-        unique_events = events_df['event_name'].unique()
+        unique_events = self.events_df['event_name'].unique()
         event_indicators = np.zeros((len(times), len(unique_events)))
         
         for i, t in enumerate(times):
@@ -467,7 +471,7 @@ def train_model(model, train_loader, epochs=10, lr=1e-3, clip_grad=10.0):
             first_obs = values[:, 0, :]
             
             # Forward pass
-            pred, _ = model(first_obs, times[:, 0], times)
+            pred, _ = model(first_obs, times[:, 0].unsqueeze(1), times, mask)
             
             # Calculate loss (MSE on valid time points only)
             loss = torch.sum(((pred - values) ** 2) * mask.unsqueeze(-1)) / torch.sum(mask)
