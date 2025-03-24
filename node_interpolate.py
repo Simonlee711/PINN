@@ -298,8 +298,10 @@ class LatentODEModel(nn.Module):
         self.latent_dim = latent_dim
         
     def forward(self, first_obs, first_time, query_times, mask=None):
-        # If no mask is provided, assume query_times is one-dimensional and common to all samples.
-        if mask is None or query_times.dim() == 1:
+        # If no mask is provided, ensure query_times is one-dimensional.
+        if mask is None:
+            if query_times.dim() == 2 and query_times.size(0) == 1:
+                query_times = query_times.squeeze(0)
             first_latent = self.encoder(first_obs)
             latent_traj = odeint(self.dynamics, first_latent, query_times, method='dopri5')
             # latent_traj shape: (num_times, batch_size, latent_dim)
@@ -309,6 +311,7 @@ class LatentODEModel(nn.Module):
             pred = self.decoder(latent_traj_reshaped)
             pred = pred.reshape(batch_size, num_times, -1)
             return pred, latent_traj
+
         
         # Otherwise, handle each sample individually based on its valid time points.
         batch_size, max_len = query_times.shape
@@ -513,7 +516,7 @@ def evaluate_model(model, test_loader):
             first_obs = values[:, 0, :]
             
             # Forward pass
-            pred, _ = model(first_obs, times[:, 0], times)
+            pred, _ = model(first_obs, times[:, 0].unsqueeze(1), times, mask)
             
             # Calculate MSE on valid time points only
             mse = torch.sum(((pred - values) ** 2) * mask.unsqueeze(-1)) / torch.sum(mask)
